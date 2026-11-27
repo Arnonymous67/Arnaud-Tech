@@ -1,0 +1,364 @@
+#!/usr/bin/env bash
+# =============================================================================
+# setup-routeur.sh : configure un routeur Debian (LAN -> WAN) avec UFW
+#
+# Etapes realisees (d'apres la documentation "Routing sur Debian avec UFW") :
+#   1. Depots apt                    5. Routage IP + SNAT (LAN -> exterieur)
+#   2. Installation de sudo          5.1 Flux autorises (DNS, HTTP, HTTPS)
+#   3. Configuration reseau          6. DNAT (adresse publique -> serveur web)
+#   4. Installation de UFW           6.1 Flux autorises vers le serveur web
+#
+# Usage :   sudo ./setup-routeur.sh          (questions interactives)
+#           sudo ./setup-routeur.sh --yes    (pas de confirmation finale)
+#
+# Les variables peuvent aussi etre fournies avant l'appel pour eviter les
+# questions, par exemple :
+#   WAN_IF=wlx002df45b569c LAN_IF=eno1 sudo -E ./setup-routeur.sh
+#
+# Les fichiers modifies sont sauvegardes dans /root/backup-routeur-<date>/
+# Le script peut etre relance sans creer de doublons.
+# =============================================================================
+set -Eeuo pipefail
+trap 'echo -e "\n[ERREUR] Le script s est arrete ligne $LINENO. Les sauvegardes sont dans ${BACKUP_DIR:-/root}." >&2' ERR
+
+ASSUME_YES=0
+[[ "${1:-}" == "--yes" || "${1:-}" == "-y" ]] && ASSUME_YES=1
+
+# --------------------------- Fonctions utilitaires ---------------------------
+info()  { echo -e "\n\e[1;34m==>\e[0m \e[1m$*\e[0m"; }
+ok()    { echo -e "    \e[32m[OK]\e[0m $*"; }
+warn()  { echo -e "    \e[33m[ATTENTION]\e[0m $*"; }
+die()   { echo -e "\e[31m[ERREUR]\e[0m $*" >&2; exit 1; }
+
+valid_ip() {
+  local ip="$1" o
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  local IFS=.
+  for o in $ip; do (( o <= 255 )) || return 1; done
+}
+valid_if()     { [[ -d "/sys/class/net/$1" && "$1" != "lo" ]]; }
+valid_prefix() { [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 8 && $1 <= 30 )); }
+valid_yn()     { [[ "$1" =~ ^[oOnNyY]$ ]]; }
+valid_any()    { [[ -n "$1" ]]; }
+
+# ask VAR "Question" "defaut" validateur
+# Si la variable est deja definie dans l'environnement, elle est validee et reutilisee.
+ask() {
+  local var="$1" prompt="$2" def="${3:-}" validator="${4:-valid_any}" val
+  if [[ -n "${!var:-}" ]]; then
+    "$validator" "${!var}" || die "Valeur invalide pour $var : ${!var}"
+    return
+  fi
+  while true; do
+    if [[ -n "$def" ]]; then
+      read -r -p "  $prompt [$def] : " val; val="${val:-$def}"
+    else
+      read -r -p "  $prompt : " val
+    fi
+    if "$validator" "$val"; then break; fi
+    echo "    Valeur invalide, recommencez."
+  done
+  printf -v "$var" '%s' "$val"
+}
+
+ip2int() { local IFS=.; local a b c d; read -r a b c d <<<"$1"; echo $(( (a<<24) + (b<<16) + (c<<8) + d )); }
+int2ip() { local n=$1; echo "$(( (n>>24)&255 )).$(( (n>>16)&255 )).$(( (n>>8)&255 )).$(( n&255 ))"; }
+
+backup() {
+  local f="$1"
+  [[ -e "$f" ]] || return 0
+  mkdir -p "$BACKUP_DIR"
+  cp -a "$f" "$BACKUP_DIR/$(echo "$f" | tr '/' '_')"
+}
+
+# --------------------------- Verifications de depart -------------------------
+[[ $EUID -eq 0 ]] || die "Ce script doit etre lance en root (sudo ./setup-routeur.sh)."
+[[ -r /etc/os-release ]] || die "Systeme non reconnu."
+. /etc/os-release
+[[ "${ID:-}" == "debian" ]] || die "Ce script est prevu pour Debian (detecte : ${ID:-inconnu})."
+
+BACKUP_DIR="/root/backup-routeur-$(date +%Y%m%d-%H%M%S)"
+
+echo "=============================================================="
+echo "   Configuration automatique du routeur Debian (UFW + NAT)"
+echo "=============================================================="
+echo
+echo "Interfaces reseau detectees sur cette machine :"
+ip -br addr show | sed 's/^/    /'
+echo
+
+# --------------------------- Saisie des variables ----------------------------
+info "Saisie des parametres"
+
+echo "  -- Interfaces --"
+ask WAN_IF "Nom de l'interface WAN (cote internet), ex: wlx002df45b569c" "" valid_if
+ask LAN_IF "Nom de l'interface LAN (cote reseau interne), ex: eno1" "" valid_if
+[[ "$WAN_IF" != "$LAN_IF" ]] || die "Les interfaces WAN et LAN doivent etre differentes."
+
+echo "  -- Reseau LAN --"
+ask LAN_IP     "Adresse IP fixe du routeur cote LAN" "192.168.67.1" valid_ip
+ask LAN_PREFIX "Longueur du masque LAN (ex: 24 pour 255.255.255.0)" "24" valid_prefix
+
+echo "  -- Reseau WAN --"
+ask WAN_IP "Adresse IP du routeur cote WAN (utilisee pour le SNAT et le DNAT)" "" valid_ip
+ask WAN_MODE_STATIC "L'interface WAN est-elle en IP fixe ? (o = fixe, n = DHCP)" "n" valid_yn
+if [[ "$WAN_MODE_STATIC" =~ ^[oOyY]$ ]]; then
+  ask WAN_PREFIX "Longueur du masque WAN" "24" valid_prefix
+  ask WAN_GW     "Passerelle par defaut du WAN" "" valid_ip
+fi
+
+WAN_IS_WIFI=0
+[[ -d "/sys/class/net/$WAN_IF/wireless" ]] && WAN_IS_WIFI=1
+if (( WAN_IS_WIFI )); then
+  echo "  -- Wi-Fi (l'interface WAN est une carte sans fil) --"
+  ask WIFI_SSID "Nom du reseau Wi-Fi (SSID)" "" valid_any
+  if [[ -z "${WIFI_PSK:-}" ]]; then
+    while true; do
+      read -r -s -p "  Mot de passe du Wi-Fi : " WIFI_PSK; echo
+      [[ -n "$WIFI_PSK" ]] && break
+    done
+  fi
+fi
+
+echo "  -- Serveur web (DNAT) --"
+ask ENABLE_DNAT "Rediriger les ports 80/443 de l'IP WAN vers un serveur web du LAN ? (o/n)" "o" valid_yn
+if [[ "$ENABLE_DNAT" =~ ^[oOyY]$ ]]; then
+  ask WEB_IP "Adresse IP fixe du serveur web dans le LAN" "192.168.67.2" valid_ip
+fi
+
+echo "  -- Compte administrateur --"
+ask ADMIN_USER "Utilisateur local a ajouter au groupe sudo (laisser '-' pour ignorer)" "-" valid_any
+
+echo "  -- Depots Debian --"
+ask DEB_CODENAME "Nom de code de la distribution (bookworm = Debian 12, trixie = Debian 13)" "${VERSION_CODENAME:-bookworm}" valid_any
+
+# --------------------------- Calculs derives ---------------------------------
+MASK_INT=$(( (0xFFFFFFFF << (32 - LAN_PREFIX)) & 0xFFFFFFFF ))
+LAN_MASK="$(int2ip "$MASK_INT")"
+LAN_NET_INT=$(( $(ip2int "$LAN_IP") & MASK_INT ))
+LAN_NET="$(int2ip "$LAN_NET_INT")/$LAN_PREFIX"
+
+WAN_MASK=""
+if [[ "$WAN_MODE_STATIC" =~ ^[oOyY]$ ]]; then
+  WAN_MASK="$(int2ip $(( (0xFFFFFFFF << (32 - WAN_PREFIX)) & 0xFFFFFFFF )))"
+fi
+
+if [[ "$ENABLE_DNAT" =~ ^[oOyY]$ ]]; then
+  WEB_NET_INT=$(( $(ip2int "$WEB_IP") & MASK_INT ))
+  [[ "$WEB_NET_INT" == "$LAN_NET_INT" ]] || die "Le serveur web $WEB_IP n'est pas dans le reseau LAN $LAN_NET."
+fi
+
+# --------------------------- Recapitulatif -----------------------------------
+echo
+echo "--------------------------------------------------------------"
+echo " RECAPITULATIF"
+echo "--------------------------------------------------------------"
+echo " Interface WAN        : $WAN_IF $( (( WAN_IS_WIFI )) && echo '(Wi-Fi)' )"
+echo " Interface LAN        : $LAN_IF"
+echo " IP LAN du routeur    : $LAN_IP/$LAN_PREFIX   (reseau $LAN_NET)"
+if [[ "$WAN_MODE_STATIC" =~ ^[oOyY]$ ]]; then
+  echo " IP WAN du routeur    : $WAN_IP/$WAN_PREFIX  (fixe, passerelle $WAN_GW)"
+else
+  echo " IP WAN du routeur    : $WAN_IP  (DHCP, doit correspondre a l'adresse obtenue)"
+fi
+if [[ "$ENABLE_DNAT" =~ ^[oOyY]$ ]]; then
+  echo " DNAT 80/443          : $WAN_IP -> $WEB_IP"
+else
+  echo " DNAT 80/443          : desactive"
+fi
+echo " Utilisateur sudo     : $ADMIN_USER"
+echo " Distribution apt     : $DEB_CODENAME"
+echo " Sauvegardes          : $BACKUP_DIR"
+echo "--------------------------------------------------------------"
+warn "/etc/network/interfaces sera REMPLACE (une sauvegarde est faite)."
+if systemctl is-active --quiet NetworkManager 2>/dev/null; then
+  warn "NetworkManager est actif : il peut entrer en conflit avec /etc/network/interfaces."
+fi
+if (( ! ASSUME_YES )); then
+  read -r -p "Lancer la configuration complete ? (o/N) : " go
+  [[ "$go" =~ ^[oOyY]$ ]] || die "Annule par l'utilisateur."
+fi
+
+export DEBIAN_FRONTEND=noninteractive
+
+# =============================================================================
+# 1. Depots apt
+# =============================================================================
+info "1/8 Configuration des depots apt"
+if [[ -f /etc/apt/sources.list.d/debian.sources ]]; then
+  ok "Depots deja definis dans debian.sources : sources.list conserve tel quel."
+else
+  backup /etc/apt/sources.list
+  cat > /etc/apt/sources.list <<EOF
+deb https://deb.debian.org/debian ${DEB_CODENAME} main contrib non-free non-free-firmware
+deb https://deb.debian.org/debian ${DEB_CODENAME}-updates main contrib non-free non-free-firmware
+deb https://security.debian.org/debian-security ${DEB_CODENAME}-security main contrib non-free non-free-firmware
+EOF
+  ok "/etc/apt/sources.list ecrit pour ${DEB_CODENAME}."
+fi
+apt-get update
+ok "Liste des paquets mise a jour."
+
+# =============================================================================
+# 2. sudo
+# =============================================================================
+info "2/8 Installation de sudo"
+apt-get install -y sudo
+if [[ "$ADMIN_USER" != "-" ]]; then
+  if id "$ADMIN_USER" &>/dev/null; then
+    adduser "$ADMIN_USER" sudo
+    ok "$ADMIN_USER ajoute au groupe sudo."
+  else
+    warn "L'utilisateur $ADMIN_USER n'existe pas : etape ignoree."
+  fi
+else
+  ok "Aucun utilisateur a ajouter."
+fi
+
+# =============================================================================
+# 3. Paquets et configuration reseau
+# =============================================================================
+info "3/8 Paquets reseau et fichier /etc/network/interfaces"
+apt-get install -y wpasupplicant wireless-tools curl iptables
+ok "Paquets wpasupplicant, wireless-tools, curl et iptables installes."
+
+backup /etc/network/interfaces
+{
+  echo "# Genere par setup-routeur.sh le $(date '+%F %T')"
+  echo "auto lo"
+  echo "iface lo inet loopback"
+  echo
+  echo "# LAN"
+  echo "auto $LAN_IF"
+  echo "iface $LAN_IF inet static"
+  echo "    address $LAN_IP"
+  echo "    netmask $LAN_MASK"
+  echo
+  echo "# WAN"
+  if (( WAN_IS_WIFI )); then echo "allow-hotplug $WAN_IF"; else echo "auto $WAN_IF"; fi
+  if [[ "$WAN_MODE_STATIC" =~ ^[oOyY]$ ]]; then
+    echo "iface $WAN_IF inet static"
+    echo "    address $WAN_IP"
+    echo "    netmask $WAN_MASK"
+    echo "    gateway $WAN_GW"
+  else
+    echo "iface $WAN_IF inet dhcp"
+  fi
+  if (( WAN_IS_WIFI )); then
+    echo "    wpa-ssid $WIFI_SSID"
+    echo "    wpa-psk $WIFI_PSK"
+  fi
+} > /etc/network/interfaces
+chmod 600 /etc/network/interfaces
+ok "/etc/network/interfaces ecrit (droits 600). Il sera applique a la fin du script."
+
+# =============================================================================
+# 4. UFW
+# =============================================================================
+info "4/8 Installation et activation de UFW"
+apt-get install -y ufw
+ufw allow 22/tcp          # SSH, pour ne pas perdre la connexion
+ufw --force enable
+ok "UFW installe et active (SSH autorise)."
+
+# =============================================================================
+# 5. Routage IP + politique par defaut + SNAT
+# =============================================================================
+info "5/8 Routage IP et SNAT"
+backup /etc/ufw/sysctl.conf
+if grep -qE '^#?net/ipv4/ip_forward=' /etc/ufw/sysctl.conf; then
+  sed -i 's|^#\?net/ipv4/ip_forward=.*|net/ipv4/ip_forward=1|' /etc/ufw/sysctl.conf
+else
+  echo "net/ipv4/ip_forward=1" >> /etc/ufw/sysctl.conf
+fi
+sysctl -w net.ipv4.ip_forward=1
+ok "Routage IPv4 active (immediatement et apres redemarrage)."
+
+ufw default deny routed
+ok "Trafic route bloque par defaut."
+
+RULES=/etc/ufw/before.rules
+backup "$RULES"
+# Retire un ancien bloc genere par ce script (evite les doublons a la relance)
+sed -i '/^# BEGIN ROUTEUR-LAB$/,/^# END ROUTEUR-LAB$/d' "$RULES"
+
+if grep -q '^\*nat' "$RULES"; then
+  warn "Un bloc *nat existe deja dans $RULES (hors de ce script)."
+  warn "Deux blocs *nat peuvent provoquer des erreurs ou des regles en double."
+  if (( ASSUME_YES )); then
+    die "Arret par securite. Fusionnez le bloc *nat existant a la main puis relancez."
+  fi
+  read -r -p "Continuer quand meme ? (o/N) : " cont
+  [[ "$cont" =~ ^[oOyY]$ ]] || die "Arret. Vos fichiers n'ont pas ete modifies pour le NAT."
+fi
+
+NAT_BLOCK="$(mktemp)"
+{
+  echo "# BEGIN ROUTEUR-LAB"
+  echo "*nat"
+  echo ":PREROUTING ACCEPT [0:0]"
+  echo ":POSTROUTING ACCEPT [0:0]"
+  if [[ "$ENABLE_DNAT" =~ ^[oOyY]$ ]]; then
+    echo "-A PREROUTING -d ${WAN_IP} -p tcp -m multiport --dports 80,443 -j DNAT --to-destination ${WEB_IP}"
+  fi
+  echo "-A POSTROUTING -s ${LAN_NET} ! -d ${LAN_NET} -j SNAT --to-source ${WAN_IP}"
+  echo "COMMIT"
+  echo "# END ROUTEUR-LAB"
+  echo
+} > "$NAT_BLOCK"
+cat "$NAT_BLOCK" "$RULES" > "${RULES}.new"
+mv "${RULES}.new" "$RULES"
+rm -f "$NAT_BLOCK"
+ok "Regles SNAT$( [[ "$ENABLE_DNAT" =~ ^[oOyY]$ ]] && echo ' et DNAT' ) ajoutees en tete de $RULES."
+
+# =============================================================================
+# 6. Flux autorises (traverser le routeur)
+# =============================================================================
+info "6/8 Flux autorises (DNS, HTTP, HTTPS)"
+ufw route allow from "$LAN_NET" to any port 53
+ufw route allow from "$LAN_NET" to any port 80,443 proto tcp
+ok "Le LAN peut utiliser DNS (53) et le web (80/443) vers l'exterieur."
+
+if [[ "$ENABLE_DNAT" =~ ^[oOyY]$ ]]; then
+  ufw route allow proto tcp from any to "$WEB_IP" port 80,443
+  ok "Acces entrant 80/443 autorise vers le serveur web $WEB_IP."
+fi
+
+# =============================================================================
+# 7. Application de UFW
+# =============================================================================
+info "7/8 Rechargement de UFW"
+ufw reload
+ok "Configuration UFW appliquee."
+
+# =============================================================================
+# 8. Application du reseau
+# =============================================================================
+info "8/8 Application de la configuration reseau"
+if systemctl is-active --quiet NetworkManager 2>/dev/null; then
+  warn "NetworkManager actif : redemarrage du reseau ignore. Redemarrez la machine pour appliquer."
+else
+  warn "Si vous etes connecte en SSH, la connexion peut etre interrompue quelques secondes."
+  systemctl restart networking || warn "Le redemarrage de 'networking' a echoue, verifiez /etc/network/interfaces."
+  ifup "$WAN_IF" 2>/dev/null || true
+  ifup "$LAN_IF" 2>/dev/null || true
+  # Le rechargement d'UFW apres la remise en route du reseau garantit des regles propres
+  ufw reload
+  ok "Reseau applique."
+fi
+
+# =============================================================================
+# Verification finale
+# =============================================================================
+echo
+echo "=============================================================="
+echo " VERIFICATION FINALE"
+echo "=============================================================="
+echo "-- Adresses --";           ip -br addr show
+echo "-- Routage IPv4 (doit afficher 1) --"; sysctl -n net.ipv4.ip_forward
+echo "-- Regles NAT --";         iptables -t nat -S 2>/dev/null | grep -E 'SNAT|DNAT' || echo "(aucune regle SNAT/DNAT visible)"
+echo "-- UFW --";                ufw status verbose
+echo
+echo "Sauvegardes des fichiers modifies : $BACKUP_DIR"
+echo "Test conseille depuis un poste du LAN : ping 8.8.8.8 puis ping google.com"
+echo "Termine."
